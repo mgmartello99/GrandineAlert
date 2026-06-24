@@ -1,6 +1,7 @@
 import time
 import requests
 import asyncio
+import math
 from datetime import date, datetime
 
 from db import get_all_users
@@ -43,14 +44,32 @@ def current_hour_index(data):
 
 
 # 🛰 RADAR LIVE
-def get_radar_image():
+def _latlon_to_tile(lat, lon, zoom):
+    """Converte coordinate lat/lon nel sistema di tile (slippy map),
+    lo stesso usato da RainViewer/Google Maps/OSM."""
+    lat_rad = math.radians(lat)
+    n = 2 ** zoom
+    x = int((lon + 180.0) / 360.0 * n)
+    y = int((1.0 - math.log(math.tan(lat_rad) + 1.0 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
+    return x, y
+
+
+def get_radar_image(lat, lon, zoom=7):
+    """
+    Restituisce l'URL del tile radar centrato sulla città dell'utente.
+    Con zoom=0 (come nella versione precedente) esiste un solo tile al
+    mondo: l'immagine mostrava l'intero pianeta, con la propria città
+    invisibile su quella scala. zoom=7 inquadra circa 100-150 km,
+    una scala utile per vedere un fronte di temporale in arrivo.
+    """
     try:
         r = requests.get("https://api.rainviewer.com/public/weather-maps.json", timeout=20)
         r.raise_for_status()
         data = r.json()
 
         path = data["radar"]["nowcast"][0]["path"]
-        return f"https://tilecache.rainviewer.com{path}/512/0/0/0/0_0.png"
+        x, y = _latlon_to_tile(lat, lon, zoom)
+        return f"https://tilecache.rainviewer.com{path}/512/{zoom}/{x}/{y}/0/0_0.png"
 
     except (requests.RequestException, KeyError, IndexError) as e:
         print("[RADAR] errore:", e)
@@ -159,7 +178,7 @@ def run_monitor(bot, loop):
                 if sent.get(key) == (level, today):
                     continue
 
-                radar = get_radar_image()
+                radar = get_radar_image(lat, lon)
 
                 msg = (
                     f"🌩 RISCHIO GRANDINE {level}\n\n"
