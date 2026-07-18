@@ -2,7 +2,7 @@ import time
 import requests
 import asyncio
 import math
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from db import get_all_users
 from config import CHECK_INTERVAL
@@ -15,7 +15,7 @@ def get_weather(lat, lon):
         "latitude": lat,
         "longitude": lon,
         "hourly": "precipitation_probability,cape,weather_code,freezing_level_height",
-        "forecast_days": 1,
+        "forecast_days": 2,
         # "auto" allinea l'array orario al fuso orario del posto,
         # invece di restituirlo in UTC (altrimenti l'indice [0]
         # corrisponde a mezzanotte UTC, non a "ora")
@@ -29,18 +29,38 @@ def get_weather(lat, lon):
 def current_hour_index(data):
     """
     Trova nell'array orario l'indice corrispondente all'ora attuale
-    (locale, grazie a timezone=auto). Senza questo, leggere sempre [0]
-    significa leggere le condizioni di mezzanotte, non quelle di adesso:
-    in pieno pomeriggio con lampi in corso lo score puo' uscire 0 perche'
-    si stanno guardando dati di tutt'altro momento della giornata.
+    LOCALE ALLA CITTA'.
+
+    ATTENZIONE: datetime.now() darebbe l'ora del server, non quella
+    della citta'. Con timezone=auto, Open-Meteo restituisce gli orari
+    gia' nel fuso locale del posto (es. Europe/Rome): se il server gira
+    in un fuso diverso (tipicamente UTC su un VPS), confrontare
+    datetime.now() con quegli orari non trova MAI una corrispondenza e
+    si ricade sempre sul fallback idx=0, cioe' sui dati di mezzanotte,
+    a qualunque ora del giorno il monitor venga eseguito.
+    Per questo si usa "utc_offset_seconds" restituito dalla stessa
+    risposta API per calcolare l'ora locale a partire da UTC, invece di
+    fidarsi dell'orologio di sistema.
     """
     times = data["hourly"]["time"]  # es. "2026-06-22T14:00"
-    now = datetime.now().strftime("%Y-%m-%dT%H:00")
+
+    offset = data.get("utc_offset_seconds", 0)
+    local_now = datetime.utcnow() + timedelta(seconds=offset)
+    now = local_now.strftime("%Y-%m-%dT%H:00")
 
     if now in times:
         return times.index(now)
 
-    return 0  # fallback se per qualche motivo non si trova l'ora esatta
+    # fallback: se per un istante l'ora esatta non matcha (es. secondi
+    # di scarto tra la chiamata e il minuto tondo), prendo l'orario piu'
+    # vicino a "adesso" invece di ripiegare ciecamente su [0]/mezzanotte
+    try:
+        target = datetime.strptime(now, "%Y-%m-%dT%H:00")
+        parsed = [datetime.strptime(t, "%Y-%m-%dT%H:00") for t in times]
+        closest = min(range(len(parsed)), key=lambda i: abs(parsed[i] - target))
+        return closest
+    except ValueError:
+        return 0
 
 
 # 🛰 RADAR LIVE
@@ -67,9 +87,10 @@ def get_radar_image(lat, lon, zoom=7):
         r.raise_for_status()
         data = r.json()
 
+        host = data.get("host", "https://tilecache.rainviewer.com")
         path = data["radar"]["nowcast"][0]["path"]
         x, y = _latlon_to_tile(lat, lon, zoom)
-        return f"https://tilecache.rainviewer.com{path}/512/{zoom}/{x}/{y}/0/0_0.png"
+        return f"{host}{path}/512/{zoom}/{x}/{y}/0/0_0.png"
 
     except (requests.RequestException, KeyError, IndexError) as e:
         print("[RADAR] errore:", e)
@@ -129,6 +150,31 @@ def level_for_score(score):
     return "MEDIO"
 
 
+def _schedule(coro, loop, label):
+    """
+    Wrapper attorno a run_coroutine_threadsafe che NON lascia sparire gli
+    errori nel nulla.
+
+    run_coroutine_threadsafe ritorna una concurrent.futures.Future: se
+    nessuno la legge (col vecchio codice non veniva mai letta), qualsiasi
+    eccezione sollevata dentro la coroutine resta intrappolata nella
+    Future e non viene mai stampata. E' esattamente quello che succedeva
+    con send_photo: se Telegram rifiuta l'URL (timeout nello scaricarla,
+    "wrong file identifier/HTTP URL specified", host non raggiungibile
+    dai server Telegram, ecc.) l'errore non arrivava mai in console e la
+    foto sembrava "non partire mai" senza nessun indizio del perche'.
+    """
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+
+    def _log_if_failed(f):
+        exc = f.exception()
+        if exc:
+            print(f"[MONITOR] invio fallito ({label}):", repr(exc))
+
+    future.add_done_callback(_log_if_failed)
+    return future
+
+
 # 🔔 MONITOR LOOP
 def run_monitor(bot, loop):
     """
@@ -158,9 +204,14 @@ def run_monitor(bot, loop):
                 wc = h["weather_code"][idx] or 0
                 freezing = h["freezing_level_height"][idx] or 9999
 
+                # orario a cui si riferisce la previsione usata per lo score,
+                # es. "2026-07-17T15:00" -> "15:00". Senza questo il messaggio
+                # non specifica MAI a che ora e' previsto il rischio.
+                orario = h["time"][idx].split("T")[1]
+
                 score = hail_score(cape, precip, wc, freezing)
                 print(
-                    f"[DEBUG] {city} -> score {score} "
+                    f"[DEBUG] {city} @ {orario} -> score {score} "
                     f"(precip={precip}%, cape={cape}, weather_code={wc}, "
                     f"freezing={freezing}m, idx={idx})"
                 )
@@ -183,20 +234,23 @@ def run_monitor(bot, loop):
                 msg = (
                     f"🌩 RISCHIO GRANDINE {level}\n\n"
                     f"📍 {city}\n"
+                    f"🕒 Orario previsto: {orario}\n"
                     f"🎯 Score: {score}/100\n\n"
                     f"🌧 Pioggia: {precip}%\n"
                     f"⚡ CAPE: {cape}\n"
                     f"❄️ Zero termico: {freezing} m"
                 )
 
-                asyncio.run_coroutine_threadsafe(
-                    bot.send_message(chat_id=chat_id, text=msg), loop
+                _schedule(
+                    bot.send_message(chat_id=chat_id, text=msg), loop, "testo"
                 )
 
                 if radar:
-                    asyncio.run_coroutine_threadsafe(
-                        bot.send_photo(chat_id=chat_id, photo=radar), loop
+                    _schedule(
+                        bot.send_photo(chat_id=chat_id, photo=radar), loop, "radar"
                     )
+                else:
+                    print(f"[MONITOR] nessuna immagine radar disponibile per {city}")
 
                 sent[key] = (level, today)
 
