@@ -2,7 +2,7 @@ import time
 import requests
 import asyncio
 import math
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from db import get_all_users
 from config import CHECK_INTERVAL
@@ -26,41 +26,49 @@ def get_weather(lat, lon):
     return r.json()
 
 
+from datetime import datetime, timezone, timedelta
+
+
 def current_hour_index(data):
     """
-    Trova nell'array orario l'indice corrispondente all'ora attuale
-    LOCALE ALLA CITTA'.
-
-    ATTENZIONE: datetime.now() darebbe l'ora del server, non quella
-    della citta'. Con timezone=auto, Open-Meteo restituisce gli orari
-    gia' nel fuso locale del posto (es. Europe/Rome): se il server gira
-    in un fuso diverso (tipicamente UTC su un VPS), confrontare
-    datetime.now() con quegli orari non trova MAI una corrispondenza e
-    si ricade sempre sul fallback idx=0, cioe' sui dati di mezzanotte,
-    a qualunque ora del giorno il monitor venga eseguito.
-    Per questo si usa "utc_offset_seconds" restituito dalla stessa
-    risposta API per calcolare l'ora locale a partire da UTC, invece di
-    fidarsi dell'orologio di sistema.
+    Trova l'indice dell'ora locale corrente nei dati hourly di Open-Meteo.
     """
-    times = data["hourly"]["time"]  # es. "2026-06-22T14:00"
+
+    times = data["hourly"]["time"]
 
     offset = data.get("utc_offset_seconds", 0)
-    local_now = datetime.utcnow() + timedelta(seconds=offset)
-    now = local_now.strftime("%Y-%m-%dT%H:00")
 
-    if now in times:
-        return times.index(now)
+    local_now = (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=offset)
+    )
 
-    # fallback: se per un istante l'ora esatta non matcha (es. secondi
-    # di scarto tra la chiamata e il minuto tondo), prendo l'orario piu'
-    # vicino a "adesso" invece di ripiegare ciecamente su [0]/mezzanotte
-    try:
-        target = datetime.strptime(now, "%Y-%m-%dT%H:00")
-        parsed = [datetime.strptime(t, "%Y-%m-%dT%H:00") for t in times]
-        closest = min(range(len(parsed)), key=lambda i: abs(parsed[i] - target))
-        return closest
-    except ValueError:
-        return 0
+    target = local_now.replace(
+        minute=0,
+        second=0,
+        microsecond=0
+    )
+
+    parsed = [
+        datetime.strptime(t, "%Y-%m-%dT%H:%M")
+        for t in times
+    ]
+
+    # match esatto
+    for i, t in enumerate(parsed):
+        if t == target:
+            return i
+
+    # fallback: ultima ora disponibile precedente
+    previous = [
+        i for i, t in enumerate(parsed)
+        if t <= target
+    ]
+
+    if previous:
+        return previous[-1]
+
+    return 0
 
 
 # 🛰 RADAR LIVE
